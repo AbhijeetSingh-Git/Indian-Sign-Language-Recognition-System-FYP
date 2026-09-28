@@ -41,7 +41,7 @@ def extract_frames(video_path: str, num_frames: int = SEQUENCE_LENGTH) -> np.nda
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total_frames == 0:
         print(f"[WARNING] Video has 0 frames: {video_path}")
-        cap.release()
+        #cap.release()
         return None
 
     # Calculate evenly-spaced frame indices
@@ -58,12 +58,15 @@ def extract_frames(video_path: str, num_frames: int = SEQUENCE_LENGTH) -> np.nda
         if ret:
             # Convert BGR → RGB
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Resize frame to reduce  RAM usage                <--- changes 
+            frame_rgb = cv2.resize(frame_rgb, (224, 224))
             frames.append(frame_rgb)
     cap.release()
 
     # Pad with black frames if video was shorter than num_frames
     if len(frames) < num_frames:
-        h, w, c = frames[0].shape if frames else (480, 640, 3)
+        h, w, c = frames[0].shape if frames else (224, 224, 3)
         while len(frames) < num_frames:
             frames.append(np.zeros((h, w, c), dtype=np.uint8))
 
