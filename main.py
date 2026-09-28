@@ -12,7 +12,7 @@ from tensorflow.keras.models import load_model
 from src.data_preprocessing import extract_frames, SEQUENCE_LENGTH
 from src.feature_extraction import extract_video_keypoints
 from src.predict import text_to_speech
-from deep_translator import GoogleTranslator
+from deep_translator import MyMemoryTranslator
 from deep_translator.exceptions import TooManyRequests
 from src.services.sentence_refiner import refine_sentence
 from src.services.translation_cache import TranslationCache
@@ -21,9 +21,39 @@ app = FastAPI(title="Sign Language Recognition API")
 
 # Initialize Cache
 translation_cache = TranslationCache()
-GOOGLE_TRANSLATION_LOCK = threading.Lock()
-GOOGLE_TRANSLATION_INTERVAL_SECONDS = 1.0
-_last_google_translation_at = 0.0
+TRANSLATION_LOCK = threading.Lock()
+TRANSLATION_INTERVAL_SECONDS = 0.5
+_last_translation_at = 0.0
+
+# MyMemoryTranslator uses locale codes (e.g. 'hi-IN') rather than simple ISO codes.
+# This mapping converts the gTTS/app language codes stored in SUPPORTED_LANGUAGES to
+# the locale codes that MyMemoryTranslator accepts.  The gTTS codes are kept as the
+# canonical identifiers throughout the app (TM keys, /languages endpoint, TTS calls).
+MYMEMORY_LANG_MAP = {
+    # Indian languages
+    "hi": "hi-IN",
+    "bn": "bn-IN",
+    "ta": "ta-IN",
+    "te": "te-IN",
+    "mr": "mr-IN",
+    "gu": "gu-IN",
+    "kn": "kn-IN",
+    "ml": "ml-IN",
+    "ur": "ur-PK",
+    # International languages
+    "fr": "fr-FR",
+    "de": "de-DE",
+    "es": "es-ES",
+    "it": "it-IT",
+    "pt": "pt-PT",
+    "nl": "nl-NL",
+    "ru": "ru-RU",
+    "tr": "tr-TR",
+    "ar": "ar-SA",
+    "zh-CN": "zh-CN",
+    "ja": "ja-JP",
+    "ko": "ko-KR",
+}
 
 SUPPORTED_LANGUAGES = {
     "Indian Languages": {
@@ -59,23 +89,57 @@ for category, langs in SUPPORTED_LANGUAGES.items():
     LANGUAGES.update(langs)
 
 
-def translate_with_google(text: str, target_language: str) -> str:
-    """Serialize cache-miss requests so rapid language switching is not rate-limited."""
-    global _last_google_translation_at
+def translate_text(text: str, target_lang_code: str) -> str:
+    """
+    Translate *text* (English) to *target_lang_code* using MyMemoryTranslator.
 
-    with GOOGLE_TRANSLATION_LOCK:
-        elapsed = time.monotonic() - _last_google_translation_at
-        if elapsed < GOOGLE_TRANSLATION_INTERVAL_SECONDS:
-            time.sleep(GOOGLE_TRANSLATION_INTERVAL_SECONDS - elapsed)
+    Requests are serialised through a lock so rapid language switching does not
+    hammer the free MyMemory API tier.  Five retries with exponential back-off
+    are attempted before the exception is re-raised to the caller.
+
+    Parameters
+    ----------
+    text : str
+        English source text.
+    target_lang_code : str
+        gTTS/app language code (e.g. 'hi', 'fr', 'zh-CN').  The function maps
+        this to the MyMemory locale code internally.
+
+    Returns
+    -------
+    str
+        Translated text.
+    """
+    global _last_translation_at
+
+    mymemory_target = MYMEMORY_LANG_MAP.get(target_lang_code)
+    if not mymemory_target:
+        raise ValueError(
+            f"No MyMemory locale code found for language code '{target_lang_code}'. "
+            f"Supported codes: {list(MYMEMORY_LANG_MAP.keys())}"
+        )
+
+    with TRANSLATION_LOCK:
+        elapsed = time.monotonic() - _last_translation_at
+        if elapsed < TRANSLATION_INTERVAL_SECONDS:
+            time.sleep(TRANSLATION_INTERVAL_SECONDS - elapsed)
 
         for attempt in range(5):
-            _last_google_translation_at = time.monotonic()
+            _last_translation_at = time.monotonic()
             try:
-                return GoogleTranslator(source='en', target=target_language).translate(text)
+                translator = MyMemoryTranslator(source="en-US", target=mymemory_target)
+                result = translator.translate(text)
+                if not result:
+                    raise ValueError("MyMemoryTranslator returned empty translation.")
+                return result
             except TooManyRequests:
-                if attempt == 2:
+                # MyMemory free tier: 500 words/day without a key; raise immediately.
+                raise
+            except Exception:
+                if attempt == 4:
                     raise
                 time.sleep(2 ** attempt)
+        raise Exception("Translation failed after 5 attempts")
 
 @app.get("/languages")
 async def get_languages():
@@ -168,12 +232,14 @@ async def predict_video(video: UploadFile = File(...), language: str = Form("Eng
             else:
                 translation_source = "translator"
                 try:
-                    translated_text = translate_with_google(refined_prediction, lang_code)
+                    translated_text = translate_text(refined_prediction, lang_code)
                     translation_cache.set(refined_prediction, lang_code, translated_text)
                 except Exception as e:
-                    print(f"Translation failed: {e}")
-                    translated_text = refined_prediction
-                    lang_code = "en"
+                    print(f"[ERROR] Translation failed for lang_code='{lang_code}': {e}")
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Translation to '{language}' failed: {e}",
+                    ) from e
 
         # Text to Speech
         audio_filename = f"output_{uuid.uuid4().hex}.mp3"
@@ -215,12 +281,18 @@ async def translate_text_endpoint(text: str = Form(...), language: str = Form("E
             else:
                 translation_source = "translator"
                 try:
-                    translated_text = translate_with_google(text, lang_code)
+                    translated_text = translate_text(text, lang_code)
                     translation_cache.set(text, lang_code, translated_text)
                 except TooManyRequests as exc:
                     raise HTTPException(
                         status_code=503,
-                        detail="Google Translate is rate-limited. Please try again shortly.",
+                        detail="Translation service is rate-limited. Please try again shortly.",
+                    ) from exc
+                except Exception as exc:
+                    print(f"[ERROR] Translation failed for lang_code='{lang_code}': {exc}")
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Translation to '{language}' failed: {exc}",
                     ) from exc
 
         # Text to Speech
